@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct ProductSummary {
     pub name: String,
     pub brand: String,
+    #[serde(default)]
+    pub product_code: Option<String>,
     pub price: f64,
     pub original_price: Option<f64>,
     pub currency: String,
@@ -25,6 +27,10 @@ pub struct ProductDetail {
     pub review_count: Option<u32>,
     pub product_url: String,
     pub product_id: String,
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub image_urls: Vec<String>,
     pub in_stock: bool,
     pub description: Option<String>,
     pub product_code: Option<String>,
@@ -35,7 +41,15 @@ pub struct ProductDetail {
     pub warnings: Option<String>,
     pub shipping_weight: Option<String>,
     pub category_breadcrumb: Option<Vec<String>>,
+    #[serde(default)]
+    pub key_info: Option<KeyInfo>,
     pub review_distribution: Option<ReviewDistribution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyInfo {
+    pub country_of_origin: Option<String>,
+    pub certifications_and_diet: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

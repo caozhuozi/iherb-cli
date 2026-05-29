@@ -1,103 +1,171 @@
 ---
 name: iherb-agent
-description: Query supplement and health product data from iHerb using the iherb-cli command-line tool. Use when the user asks about supplements, vitamins, health products, or anything related to iHerb — including searching for products, comparing options, checking ingredients or nutrition facts, finding prices, reading review summaries, or getting purchase recommendations. Triggers include questions like "What's the best vitamin C?", "Find me a magnesium supplement", "What are the ingredients in this product?", "Compare omega-3 options on iHerb", or "How much does ashwagandha cost?".
+description: Use the local iherb-cli command-line tool to search iHerb products and extract scraper-friendly product metadata as JSON. Use when the user asks Codex to run iHerb searches, fetch an iHerb product detail page, inspect supplement facts, ingredients, suggested use, warnings, image URLs, category breadcrumbs, product identifiers, or produce machine-readable iHerb product/search JSON from this repository.
 ---
 
-# iherb-agent
+# iHerb Agent
 
-Use the `iherb-cli` binary to query iHerb product data. It uses a headless browser (first run may take a moment to download Chrome). Results are cached for 30 days. Every result includes a `Data from:` timestamp — use `--no-cache` if the data is stale.
+## Build
 
-## Commands
-
-### Search
+The CLI binary is named `iherb-cli`.
 
 ```bash
-iherb-cli search "<query>" [--limit <n>] [--sort <method>] [--category <slug>]
+cargo build
+./target/debug/iherb-cli --help
 ```
 
-- `--limit`: max results (default 20)
-- `--sort`: `relevance` (default), `price-asc`, `price-desc`, `rating`, `best-selling`
-- `--category`: filter by category slug (e.g., `supplements`, `vitamins`, `protein`)
+During development, `cargo run -- ...` is usually enough and automatically builds before running.
 
-Output: Markdown list with name, brand, price, rating, review count, product ID, URL.
+## Browser Profile
 
-### Product details
+Use the persisted Chrome profile for live iHerb runs:
 
 ```bash
-iherb-cli product <id-or-url> [--section <name>]
+--profile-dir ./runtime/chrome-profile
 ```
 
-Accepts a numeric product ID (e.g., `61864`) or full URL.
+This keeps cookies, storefront preferences, and challenge recovery state between runs.
 
-`--section` options: `overview`, `description`, `ingredients`, `nutrition`, `suggested-use`, `warnings`, `reviews`
+## Search Products
 
-Output: Full Markdown with overview, supplement facts table, ingredients, suggested use, warnings, review distribution.
-
-### Global flags
-
-- `--country <code>`: localized storefront (e.g., `ch`, `de`, `jp`). Default: `us`
-- `--currency <code>`: currency (e.g., `CHF`, `EUR`). Default: `USD`
-- `--no-cache`: bypass cache
-- `--debug`: show browser window
-
-## Workflows
-
-### Find the best product for a need
-
-1. Search with `--sort best-selling` or `--sort rating` to find top options
-2. Get details on 2-3 top candidates: `iherb-cli product <id>`
-3. Compare ingredients, dosage, price-per-serving, and ratings
-4. Recommend with reasoning
+Search returns a compact product discovery JSON list.
 
 ```bash
-iherb-cli search "vitamin d3" --limit 20 --sort best-selling
-iherb-cli product 53330
-iherb-cli product 18222
+cargo run -- --profile-dir ./runtime/chrome-profile --no-cache --json search 'calcium' --limit 20
 ```
 
-### Compare products
+Useful options:
 
-1. Get details for each product
-2. Extract and compare: active ingredients, dosage per serving, servings per container, price per serving, rating, form (capsule/tablet/liquid)
+- `--limit <n>`: maximum number of products to return
+- `--sort relevance|price-asc|price-desc|rating|best-selling`
+- `--category <slug>`: optional category filter
+
+Search JSON includes product ID, product code, product URL, name, and brand.
+
+Search JSON shape:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "query": "calcium",
+    "total_results": 17827,
+    "products": [
+      {
+        "product_id": "11574",
+        "product_code": "CEN-27070",
+        "product_url": "https://www.iherb.com/pr/21st-century-calcium-plus-d3-90-tablets/11574",
+        "name": "21st Century, Calcium Plus D3, 90 Tablets",
+        "brand": "21st Century"
+      }
+    ]
+  }
+}
+```
+
+## Product Details
+
+Product accepts either a full iHerb URL or a numeric product ID.
 
 ```bash
-iherb-cli product 53330 --section nutrition
-iherb-cli product 18222 --section nutrition
+cargo run -- --profile-dir ./runtime/chrome-profile --no-cache --json product 'https://www.iherb.com/pr/21st-century-calcium-plus-d3-90-tablets/11574'
 ```
 
-Calculate price-per-serving: price / servings_per_container.
+Product JSON includes supplement metadata such as:
 
-### Check specific product info
+- product identifiers and URL
+- name and brand
+- image URL fields
+- category breadcrumb
+- certifications and diet labels
+- description
+- suggested use
+- other ingredients
+- supplement facts
+- warnings
+- UPC
 
-Use `--section` to fetch only what's needed:
+Product JSON shape:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "product_id": "11574",
+    "product_code": "CEN-27070",
+    "product_url": "https://www.iherb.com/pr/21st-century-calcium-plus-d3-90-tablets/11574",
+    "name": "21st Century, Calcium Plus D3, 90 Tablets",
+    "brand": "21st Century",
+    "image_url": "https://cloudinary.images-iherb.com/image/upload/f_auto,q_auto:eco/images/cen/cen27070/y/76.jpg",
+    "image_urls": [
+      "https://cloudinary.images-iherb.com/image/upload/f_auto,q_auto:eco/images/cen/cen27070/y/76.jpg"
+    ],
+    "category_breadcrumb": [
+      "Supplements",
+      "Minerals",
+      "Calcium",
+      "Calcium & Vitamin D"
+    ],
+    "certifications_and_diet": [
+      "Gluten-free",
+      "Soy-free"
+    ],
+    "description": "Product description text...",
+    "suggested_use": "Suggested use text...",
+    "other_ingredients": "Other ingredients text...",
+    "supplement_facts": {
+      "serving_size": "1 Tablet",
+      "servings_per_container": null,
+      "nutrients": [
+        {
+          "name": "Calcium (as Calcium Carbonate)",
+          "amount": "1,000 mg",
+          "daily_value": "77%"
+        }
+      ]
+    },
+    "warnings": "Warnings text...",
+    "upc": "740985270707"
+  }
+}
+```
+
+## Output
+
+Use `--json` when another scraper or agent will consume the output. Treat stdout as the machine-readable result.
+
+For human inspection, omit `--json`:
 
 ```bash
-iherb-cli product 61864 --section ingredients   # supplement facts + other ingredients
-iherb-cli product 61864 --section nutrition      # supplement facts table only
-iherb-cli product 61864 --section reviews        # rating breakdown
+cargo run -- --profile-dir ./runtime/chrome-profile product 11574
 ```
 
-Note: `--section ingredients` returns both the supplement facts (active ingredients with amounts) and the other/inactive ingredients — everything you need in one call.
+## Timing
 
-### Find budget options
+Use `--timing` when debugging slow live runs:
 
 ```bash
-iherb-cli search "magnesium glycinate" --sort price-asc --limit 20
+cargo run -- --profile-dir ./runtime/chrome-profile --no-cache --json --timing product 11574
 ```
 
-Then verify quality by checking ingredients and ratings on the cheapest options.
+Timing logs are diagnostic output; the JSON result remains the primary output.
 
-### Localized pricing
+## Common Examples
+
+Search calcium products:
 
 ```bash
-iherb-cli search "omega 3" --country ch --currency CHF
-iherb-cli product 61864 --country de --currency EUR
+cargo run -- --profile-dir ./runtime/chrome-profile --no-cache --json search 'calcium' --limit 20
 ```
 
-## Tips
+Fetch a product detail page:
 
-- Search queries work best with specific supplement names (e.g., "magnesium glycinate" not just "magnesium")
-- Always check the supplement facts table when comparing — brand marketing can be misleading
-- Review count matters as much as rating — 4.5 stars with 10,000 reviews is more reliable than 5.0 with 12
-- When recommending, mention form (capsule, tablet, powder, liquid), dosage, servings per container, and price per serving
-- First run downloads a browser binary — warn the user it may take a moment
+```bash
+cargo run -- --profile-dir ./runtime/chrome-profile --no-cache --json product 11574
+```
+
+Fetch a full URL:
+
+```bash
+cargo run -- --profile-dir ./runtime/chrome-profile --no-cache --json product 'https://www.iherb.com/pr/21st-century-calcium-plus-d3-90-tablets/11574'
+```

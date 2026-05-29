@@ -1,6 +1,36 @@
 use crate::cli::Section;
 use crate::model::{ProductDetail, SearchResult};
+use serde::Serialize;
+use serde_json::json;
 use std::time::SystemTime;
+
+#[derive(Serialize)]
+struct SearchProductJson<'a> {
+    product_id: &'a str,
+    product_code: Option<&'a str>,
+    product_url: &'a str,
+    name: &'a str,
+    brand: &'a str,
+}
+
+#[derive(Serialize)]
+struct ProductJson<'a> {
+    product_id: &'a str,
+    product_code: Option<&'a str>,
+    product_url: &'a str,
+    name: &'a str,
+    brand: &'a str,
+    image_url: Option<&'a str>,
+    image_urls: &'a [String],
+    category_breadcrumb: Option<&'a Vec<String>>,
+    certifications_and_diet: &'a [String],
+    description: Option<&'a str>,
+    suggested_use: Option<&'a str>,
+    other_ingredients: Option<&'a str>,
+    supplement_facts: Option<&'a crate::model::SupplementFacts>,
+    warnings: Option<&'a str>,
+    upc: Option<&'a str>,
+}
 
 pub fn format_search_results(result: &SearchResult) -> String {
     let mut out = String::new();
@@ -18,6 +48,9 @@ pub fn format_search_results(result: &SearchResult) -> String {
     for (i, product) in result.products.iter().enumerate() {
         out.push_str(&format!("### {}. {}\n", i + 1, product.name));
         out.push_str(&format!("- **Brand:** {}\n", product.brand));
+        if let Some(ref code) = product.product_code {
+            out.push_str(&format!("- **Product Code:** {}\n", code));
+        }
 
         let price_str = format_price(
             product.price,
@@ -43,6 +76,74 @@ pub fn format_search_results(result: &SearchResult) -> String {
     }
 
     out
+}
+
+pub fn format_search_json(result: &SearchResult) -> serde_json::Result<String> {
+    let products: Vec<_> = result
+        .products
+        .iter()
+        .map(|product| SearchProductJson {
+            product_id: &product.product_id,
+            product_code: product.product_code.as_deref(),
+            product_url: &product.product_url,
+            name: &product.name,
+            brand: &product.brand,
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&json!({
+        "ok": true,
+        "data": {
+            "query": &result.query,
+            "total_results": result.total_results,
+            "products": products,
+        }
+    }))
+}
+
+pub fn format_product_json(product: &ProductDetail) -> serde_json::Result<String> {
+    let certifications_and_diet = product
+        .key_info
+        .as_ref()
+        .map(|info| info.certifications_and_diet.as_slice())
+        .unwrap_or(&[]);
+
+    let data = ProductJson {
+        product_id: &product.product_id,
+        product_code: product.product_code.as_deref(),
+        product_url: &product.product_url,
+        name: &product.name,
+        brand: &product.brand,
+        image_url: product.image_url.as_deref(),
+        image_urls: &product.image_urls,
+        category_breadcrumb: product.category_breadcrumb.as_ref(),
+        certifications_and_diet,
+        description: product.description.as_deref(),
+        suggested_use: product.suggested_use.as_deref(),
+        other_ingredients: product.ingredients.as_deref(),
+        supplement_facts: product.supplement_facts.as_ref(),
+        warnings: product.warnings.as_deref(),
+        upc: product.upc.as_deref(),
+    };
+
+    serde_json::to_string_pretty(&json!({
+        "ok": true,
+        "data": data,
+    }))
+}
+
+pub fn format_error_json(error_type: &str, message: &str) -> String {
+    serde_json::to_string_pretty(&json!({
+        "ok": false,
+        "error_type": error_type,
+        "message": message,
+    }))
+    .unwrap_or_else(|_| {
+        format!(
+            r#"{{"ok":false,"error_type":"{}","message":"{}"}}"#,
+            error_type, message
+        )
+    })
 }
 
 pub fn format_product_detail(product: &ProductDetail, section: Option<Section>) -> String {
@@ -79,7 +180,10 @@ pub fn format_product_detail(product: &ProductDetail, section: Option<Section>) 
 
     if out.is_empty() {
         if let Some(sec) = section {
-            out.push_str(&format!("No {} data available for this product.\n", sec.label()));
+            out.push_str(&format!(
+                "No {} data available for this product.\n",
+                sec.label()
+            ));
         }
     }
 
@@ -208,6 +312,57 @@ fn format_reviews(product: &ProductDetail, out: &mut String) {
     out.push('\n');
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ProductDetail, SupplementFacts};
+
+    #[test]
+    fn product_json_omits_dynamic_commerce_fields() {
+        let product = ProductDetail {
+            name: "Name".to_string(),
+            brand: "Brand".to_string(),
+            price: 12.34,
+            original_price: Some(15.0),
+            currency: "USD".to_string(),
+            rating: Some(4.8),
+            review_count: Some(100),
+            product_url: "https://www.iherb.com/pr/example/1".to_string(),
+            product_id: "1".to_string(),
+            image_url: None,
+            image_urls: Vec::new(),
+            in_stock: true,
+            description: None,
+            product_code: Some("ABC-123".to_string()),
+            upc: None,
+            ingredients: Some("Main Ingredients\nA\n\nOther Ingredients\nB".to_string()),
+            supplement_facts: Some(SupplementFacts {
+                serving_size: Some("1 capsule".to_string()),
+                servings_per_container: Some("30".to_string()),
+                nutrients: Vec::new(),
+            }),
+            suggested_use: None,
+            warnings: None,
+            shipping_weight: None,
+            category_breadcrumb: None,
+            key_info: None,
+            review_distribution: None,
+        };
+
+        let json = format_product_json(&product).expect("json should format");
+        assert!(json.contains("\"other_ingredients\""));
+        assert!(!json.contains("\"price\""));
+        assert!(!json.contains("\"rating\""));
+        assert!(!json.contains("\"review_count\""));
+        assert!(!json.contains("\"in_stock\""));
+        assert!(!json.contains("\"currency\""));
+        assert!(!json.contains("\"shipping_weight\""));
+        assert!(!json.contains("\"key_info\""));
+        assert!(!json.contains("\"country_of_origin\""));
+        assert!(json.contains("\"certifications_and_diet\""));
+    }
+}
+
 fn format_price(price: f64, original: Option<&f64>, currency: &str) -> String {
     let symbol = match currency {
         "USD" => "$",
@@ -245,7 +400,11 @@ pub fn format_cached_at(cached_at: SystemTime) -> String {
     let mut y = 1970i64;
     let mut d = days;
     loop {
-        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
         if d < days_in_year {
             break;
         }
@@ -256,7 +415,16 @@ pub fn format_cached_at(cached_at: SystemTime) -> String {
     let month_days = [
         31,
         if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut m = 0usize;
     for (i, &md) in month_days.iter().enumerate() {

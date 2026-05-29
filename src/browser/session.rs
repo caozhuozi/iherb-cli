@@ -30,20 +30,27 @@ pub struct BrowserSession {
     browser: Arc<Mutex<Browser>>,
     _handle: tokio::task::JoinHandle<()>,
     user_data_dir: PathBuf,
+    owns_user_data_dir: bool,
 }
 
 impl BrowserSession {
     pub async fn launch(chrome_path: PathBuf, config: &AppConfig) -> Result<Self, IherbError> {
         // Create a unique user data directory to avoid SingletonLock conflicts
         // when multiple instances run concurrently or after a stale lock is left behind.
-        let user_data_dir = std::env::temp_dir().join(format!(
-            "iherb-cli-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        ));
+        let (user_data_dir, owns_user_data_dir) = match config.profile_dir.as_ref() {
+            Some(dir) => (dir.clone(), false),
+            None => (
+                std::env::temp_dir().join(format!(
+                    "iherb-cli-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                )),
+                true,
+            ),
+        };
         std::fs::create_dir_all(&user_data_dir).map_err(|e| {
             IherbError::BrowserLaunch(format!(
                 "Failed to create user data dir {}: {}",
@@ -62,8 +69,10 @@ impl BrowserSession {
             builder = builder.arg(*arg);
         }
 
-        if !config.debug {
-            builder = builder.arg("--headless=new");
+        if config.debug {
+            builder = builder.with_head();
+        } else {
+            builder = builder.new_headless_mode();
         }
 
         // Chrome refuses to run as root without --no-sandbox
@@ -90,6 +99,7 @@ impl BrowserSession {
             browser: Arc::new(Mutex::new(browser)),
             _handle: handle,
             user_data_dir,
+            owns_user_data_dir,
         })
     }
 
@@ -139,7 +149,7 @@ impl BrowserSession {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Clean up the temporary user data directory with retry
-        if self.user_data_dir.exists() {
+        if self.owns_user_data_dir && self.user_data_dir.exists() {
             for attempt in 1..=3 {
                 match std::fs::remove_dir_all(&self.user_data_dir) {
                     Ok(_) => break,
@@ -169,7 +179,7 @@ impl BrowserSession {
 
 impl Drop for BrowserSession {
     fn drop(&mut self) {
-        if self.user_data_dir.exists() {
+        if self.owns_user_data_dir && self.user_data_dir.exists() {
             let _ = std::fs::remove_dir_all(&self.user_data_dir);
         }
     }

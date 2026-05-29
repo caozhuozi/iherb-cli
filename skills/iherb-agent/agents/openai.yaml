@@ -1,0 +1,7 @@
+interface:
+  display_name: "iHerb Agent"
+  short_description: "Build and run the iHerb scraper CLI"
+  default_prompt: "Use $iherb-agent to build, test, and operate the iherb-cli scraper-facing CLI."
+
+policy:
+  allow_implicit_invocation: true

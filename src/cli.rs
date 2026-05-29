@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 
     /// Country subdomain to use (e.g., us, ch, de). Note: iHerb may override based on your IP
     #[arg(long, global = true)]
@@ -29,10 +29,25 @@ pub struct Cli {
     /// Run browser in headed mode for troubleshooting
     #[arg(long, global = true)]
     pub debug: bool,
+
+    /// Emit scraper-friendly JSON instead of Markdown
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Chrome user data directory to persist cookies, Cloudflare clearance, and storefront preferences
+    #[arg(long, global = true)]
+    pub profile_dir: Option<std::path::PathBuf>,
+
+    /// Emit scraper timing logs to stderr
+    #[arg(long, global = true)]
+    pub timing: bool,
 }
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Open the storefront homepage for manual profile setup
+    Setup,
+
     /// Search for products on iHerb
     Search {
         /// Search term (e.g., "vitamin c", "omega 3")

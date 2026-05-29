@@ -1,8 +1,8 @@
 [package]
 name = "iherb-cli"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
-description = "CLI tool for querying iHerb product data"
+description = "Adaptation for scraping iHerb product metadata"
 
 [[bin]]
 name = "iherb-cli"

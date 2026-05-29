@@ -1,7 +1,8 @@
 use crate::error::IherbError;
-use crate::model::{Nutrient, ProductDetail, ReviewDistribution, SupplementFacts};
+use crate::model::{KeyInfo, Nutrient, ProductDetail, ReviewDistribution, SupplementFacts};
 use chromiumoxide::Page;
 use scraper::{Html, Selector};
+use std::collections::HashMap;
 
 use super::helpers::{
     debug_dump_html, detect_currency_from_html, extract_text, is_not_found_page, parse_price_str,
@@ -50,7 +51,8 @@ pub async fn extract_product(
             "Attempting __NEXT_DATA__ extraction for product {}",
             product_id
         );
-        if let Some(product) = parse_from_next_data(&next_data, product_id, base_url) {
+        if let Some(mut product) = parse_from_next_data(&next_data, product_id, base_url) {
+            enrich_from_html(html, &mut product);
             tracing::info!("Successfully extracted product from __NEXT_DATA__");
             return Ok(product);
         }
@@ -71,20 +73,22 @@ fn extract_prices_from_offers(offers: Option<&serde_json::Value>) -> (f64, Optio
     };
 
     // Try top-level offers.price
-    let top_price = offers
-        .get("price")
-        .and_then(|v| {
-            v.as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| v.as_f64())
-        });
+    let top_price = offers.get("price").and_then(|v| {
+        v.as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| v.as_f64())
+    });
     let top_currency = offers
         .get("priceCurrency")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
     if let Some(price) = top_price {
-        return (price, None, top_currency.unwrap_or_else(|| "USD".to_string()));
+        return (
+            price,
+            None,
+            top_currency.unwrap_or_else(|| "USD".to_string()),
+        );
     }
 
     // Fall back to priceSpecification array
@@ -94,13 +98,11 @@ fn extract_prices_from_offers(offers: Option<&serde_json::Value>) -> (f64, Optio
         let mut currency = None;
 
         for spec in specs {
-            let spec_price = spec
-                .get("price")
-                .and_then(|v| {
-                    v.as_str()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .or_else(|| v.as_f64())
-                });
+            let spec_price = spec.get("price").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| v.as_f64())
+            });
             let spec_currency = spec
                 .get("priceCurrency")
                 .and_then(|v| v.as_str())
@@ -200,6 +202,9 @@ fn parse_from_json_ld(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let image_urls = extract_json_ld_images(data, base_url);
+    let image_url = image_urls.first().cloned();
+
     let product_url = data
         .get("url")
         .and_then(|v| v.as_str())
@@ -216,6 +221,8 @@ fn parse_from_json_ld(
         review_count,
         product_url,
         product_id: product_id.to_string(),
+        image_url,
+        image_urls,
         in_stock,
         description,
         product_code,
@@ -226,6 +233,7 @@ fn parse_from_json_ld(
         warnings: None,         // enriched from DOM
         shipping_weight: None,  // enriched from DOM
         category_breadcrumb: None,
+        key_info: None,
         review_distribution: None, // enriched from DOM
     })
 }
@@ -279,6 +287,8 @@ fn parse_from_js_globals(
         review_count: None,
         product_url: format!("{}/pr/p/{}", base_url, product_id),
         product_id: product_id.to_string(),
+        image_url: None,
+        image_urls: Vec::new(),
         in_stock: true,
         description: None,
         product_code,
@@ -289,6 +299,7 @@ fn parse_from_js_globals(
         warnings: None,
         shipping_weight: None,
         category_breadcrumb: None,
+        key_info: None,
         review_distribution: None,
     })
 }
@@ -314,6 +325,9 @@ fn enrich_from_html(html: &str, product: &mut ProductDetail) {
     }
 
     enrich_product_specs(&doc, product);
+    enrich_images(&doc, product);
+    enrich_breadcrumb(&doc, product);
+    enrich_key_info(&doc, product);
     parse_overview_sections(html, product);
 
     if product.supplement_facts.is_none() {
@@ -336,10 +350,7 @@ fn enrich_pricing(doc: &Html, product: &mut ProductDetail) {
         Some(el) => el,
         None => return,
     };
-    let list_price = el
-        .value()
-        .attr("data-list-price")
-        .and_then(parse_price_str);
+    let list_price = el.value().attr("data-list-price").and_then(parse_price_str);
     let disc_price = el
         .value()
         .attr("data-discount-price")
@@ -377,12 +388,189 @@ fn enrich_product_specs(doc: &Html, product: &mut ProductDetail) {
     }
 }
 
+fn enrich_images(doc: &Html, product: &mut ProductDetail) {
+    let product_code_key = product.product_code.as_deref().map(product_code_path_key);
+    let mut candidates = Vec::new();
+
+    for url in &product.image_urls {
+        collect_image_candidate(url, product_code_key.as_deref(), &mut candidates);
+    }
+
+    for selector in [
+        r#"meta[property="og:image"]"#,
+        r#"meta[name="og:image"]"#,
+        r#"meta[property="twitter:image"]"#,
+        "img",
+        "source",
+    ] {
+        let Ok(sel) = Selector::parse(selector) else {
+            continue;
+        };
+        for el in doc.select(&sel) {
+            for attr in [
+                "content",
+                "data-lazyload",
+                "data-large-img",
+                "data-src",
+                "data-image-src",
+                "src",
+                "srcset",
+            ] {
+                if let Some(value) = el.value().attr(attr) {
+                    if attr == "srcset" {
+                        for srcset_url in split_srcset(value) {
+                            collect_image_candidate(
+                                &srcset_url,
+                                product_code_key.as_deref(),
+                                &mut candidates,
+                            );
+                        }
+                    } else {
+                        collect_image_candidate(
+                            value,
+                            product_code_key.as_deref(),
+                            &mut candidates,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let urls = select_best_image_urls(candidates);
+    if !urls.is_empty() {
+        product.image_url = urls.first().cloned();
+        product.image_urls = urls;
+    } else if product.image_url.is_none() {
+        product.image_url = product.image_urls.first().cloned();
+    }
+}
+
+fn enrich_breadcrumb(doc: &Html, product: &mut ProductDetail) {
+    if product.category_breadcrumb.is_some() {
+        return;
+    }
+
+    if let Some(crumbs) = extract_breadcrumb_json_ld(doc) {
+        product.category_breadcrumb = Some(crumbs);
+        return;
+    }
+
+    let mut crumbs = Vec::new();
+    for selector in [
+        ".breadcrumb li a",
+        "ol.breadcrumb li a",
+        "[itemtype='https://schema.org/BreadcrumbList'] [itemprop='name']",
+    ] {
+        let Ok(sel) = Selector::parse(selector) else {
+            continue;
+        };
+        for el in doc.select(&sel) {
+            let text = normalize_text(&el.text().collect::<Vec<_>>().join(" "));
+            if is_real_breadcrumb_node(&text) && !crumbs.contains(&text) {
+                crumbs.push(text);
+            }
+        }
+        if !crumbs.is_empty() {
+            break;
+        }
+    }
+
+    if !crumbs.is_empty() {
+        product.category_breadcrumb = Some(crumbs);
+    }
+}
+
+fn extract_breadcrumb_json_ld(doc: &Html) -> Option<Vec<String>> {
+    let sel = Selector::parse(r#"script[type="application/ld+json"]"#).ok()?;
+    for el in doc.select(&sel) {
+        let text: String = el.text().collect();
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if let Some(crumbs) = parse_breadcrumb_json_ld_value(&parsed) {
+            return Some(crumbs);
+        }
+    }
+    None
+}
+
+fn parse_breadcrumb_json_ld_value(value: &serde_json::Value) -> Option<Vec<String>> {
+    if value.get("@type").and_then(|v| v.as_str()) == Some("BreadcrumbList") {
+        let items = value.get("itemListElement")?.as_array()?;
+        let crumbs: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                item.get("item")
+                    .and_then(|i| i.get("name"))
+                    .or_else(|| item.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(normalize_text)
+            })
+            .filter(|text| is_real_breadcrumb_node(text))
+            .collect();
+        if !crumbs.is_empty() {
+            return Some(crumbs);
+        }
+    }
+
+    if let Some(arr) = value.as_array() {
+        for item in arr {
+            if let Some(crumbs) = parse_breadcrumb_json_ld_value(item) {
+                return Some(crumbs);
+            }
+        }
+    }
+    None
+}
+
+fn is_real_breadcrumb_node(text: &str) -> bool {
+    !text.is_empty() && !text.eq_ignore_ascii_case("Categories")
+}
+
+fn enrich_key_info(doc: &Html, product: &mut ProductDetail) {
+    let certifications_and_diet = extract_certification_labels(doc);
+
+    if !certifications_and_diet.is_empty() {
+        product.key_info = Some(KeyInfo {
+            country_of_origin: None,
+            certifications_and_diet,
+        });
+    }
+}
+
+fn extract_certification_labels(doc: &Html) -> Vec<String> {
+    let mut labels = Vec::new();
+    for selector in [
+        ".product-at-a-glance__cert-label",
+        "#at-a-glance-cert-list .product-at-a-glance__cert-label",
+        ".attribute-list li",
+        ".product-attributes li",
+        ".product-summary-attribute",
+        "[data-testid='product-attribute']",
+    ] {
+        let Ok(sel) = Selector::parse(selector) else {
+            continue;
+        };
+        for el in doc.select(&sel) {
+            let text = normalize_text(&el.text().collect::<Vec<_>>().join(" "));
+            if !text.is_empty() && !labels.contains(&text) {
+                labels.push(text);
+            }
+        }
+        if !labels.is_empty() {
+            break;
+        }
+    }
+    labels
+}
+
 /// Parse structured sections (Suggested Use, Warnings, Ingredients, Description) from product overview.
 fn parse_overview_sections(html: &str, product: &mut ProductDetail) {
     let doc = Html::parse_document(html);
 
     if product.ingredients.is_none() {
-        if let Some(text) = extract_text(&doc, ".prodOverviewIngred") {
+        if let Some(text) = extract_section_text(&doc, ".prodOverviewIngred") {
             product.ingredients = Some(text);
         }
     }
@@ -439,15 +627,18 @@ fn assign_section_by_heading(heading: &str, content: String, product: &mut Produ
         product.warnings = Some(content);
     } else if heading.contains("description") && product.description.is_none() {
         product.description = Some(content);
+    } else if heading.contains("overview") && product.description.is_none() {
+        product.description = Some(content);
     }
 }
 
 /// Extract a value from #product-specs-list by label prefix.
 fn extract_spec(doc: &Html, label: &str) -> Option<String> {
     if let Ok(sel) = Selector::parse("#product-specs-list li") {
+        let label_lower = label.to_lowercase();
         for li in doc.select(&sel) {
             let text: String = li.text().collect::<Vec<_>>().join("").trim().to_string();
-            if text.starts_with(label) {
+            if text.to_lowercase().starts_with(&label_lower) {
                 // Extract the value after the label and colon
                 let value = text
                     .split_once(':')
@@ -580,6 +771,8 @@ pub fn parse_from_next_data(
         review_count,
         product_url,
         product_id: product_id.to_string(),
+        image_url: None,
+        image_urls: Vec::new(),
         in_stock,
         description,
         product_code,
@@ -590,6 +783,7 @@ pub fn parse_from_next_data(
         warnings,
         shipping_weight,
         category_breadcrumb: None,
+        key_info: None,
         review_distribution: None,
     })
 }
@@ -607,8 +801,8 @@ pub fn parse_from_html(
         return Err(IherbError::ProductNotFound(product_id.to_string()));
     }
 
-    let name = extract_text(&doc, "h1#name, h1[data-testid='product-name'], h1")
-        .unwrap_or_default();
+    let name =
+        extract_text(&doc, "h1#name, h1[data-testid='product-name'], h1").unwrap_or_default();
 
     // If we couldn't extract a meaningful product name, this is not a valid product page
     if name.is_empty() || name == "Unknown Product" {
@@ -652,8 +846,7 @@ pub fn parse_from_html(
     let review_distribution = parse_review_distribution_html(&doc);
 
     // Detect actual currency from the page, falling back to config currency
-    let detected_currency =
-        detect_currency_from_html(&doc).unwrap_or_else(|| currency.to_string());
+    let detected_currency = detect_currency_from_html(&doc).unwrap_or_else(|| currency.to_string());
 
     let product_url = format!("{}/pr/p/{}", base_url, product_id);
 
@@ -667,6 +860,8 @@ pub fn parse_from_html(
         review_count,
         product_url,
         product_id: product_id.to_string(),
+        image_url: None,
+        image_urls: Vec::new(),
         in_stock,
         description: None,
         product_code,
@@ -677,11 +872,15 @@ pub fn parse_from_html(
         warnings: None,
         shipping_weight,
         category_breadcrumb: None,
+        key_info: None,
         review_distribution,
     };
 
     // Parse structured overview sections
     parse_overview_sections(html, &mut product);
+    enrich_images(&doc, &mut product);
+    enrich_breadcrumb(&doc, &mut product);
+    enrich_key_info(&doc, &mut product);
 
     Ok(product)
 }
@@ -702,6 +901,208 @@ fn extract_prices_from_input(doc: &Html) -> Option<(f64, Option<f64>)> {
         (None, Some(list)) => Some((list, None)),
         _ => None,
     }
+}
+
+fn extract_json_ld_images(data: &serde_json::Value, base_url: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let Some(image) = data.get("image") else {
+        return urls;
+    };
+
+    if let Some(url) = image.as_str().and_then(|s| normalize_url(s, base_url)) {
+        urls.push(url);
+    } else if let Some(arr) = image.as_array() {
+        for item in arr {
+            if let Some(url) = item.as_str().and_then(|s| normalize_url(s, base_url)) {
+                if !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+        }
+    }
+    urls
+}
+
+#[derive(Debug, Clone)]
+struct ImageCandidate {
+    url: String,
+    image_id: String,
+    variant_rank: usize,
+    first_seen: usize,
+}
+
+fn collect_image_candidate(
+    raw: &str,
+    product_code_key: Option<&str>,
+    candidates: &mut Vec<ImageCandidate>,
+) {
+    let Some(url) = normalize_image_url(raw) else {
+        return;
+    };
+    let Some(mut candidate) = parse_iherb_cloudinary_product_image(&url, product_code_key) else {
+        return;
+    };
+    if !candidates
+        .iter()
+        .any(|existing| existing.url == candidate.url)
+    {
+        candidate.first_seen = candidates.len();
+        candidates.push(candidate);
+    }
+}
+
+fn parse_iherb_cloudinary_product_image(
+    url: &str,
+    product_code_key: Option<&str>,
+) -> Option<ImageCandidate> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.host_str()? != "cloudinary.images-iherb.com" {
+        return None;
+    }
+
+    let segments: Vec<_> = parsed.path_segments()?.collect();
+    let images_idx = segments.iter().position(|segment| *segment == "images")?;
+    let brand = *segments.get(images_idx + 1)?;
+    let code = *segments.get(images_idx + 2)?;
+    let variant = *segments.get(images_idx + 3)?;
+    let image_id = *segments.get(images_idx + 4)?;
+
+    if matches!(brand, "static" | "cms" | "campaign" | "background-image") {
+        return None;
+    }
+    if let Some(expected_code) = product_code_key {
+        if code != expected_code {
+            return None;
+        }
+    }
+
+    let variant_rank = image_variant_rank(variant)?;
+    if !image_id.ends_with(".jpg") && !image_id.ends_with(".png") && !image_id.ends_with(".webp") {
+        return None;
+    }
+
+    Some(ImageCandidate {
+        url: url.to_string(),
+        image_id: image_id.to_string(),
+        variant_rank,
+        first_seen: 0,
+    })
+}
+
+fn select_best_image_urls(candidates: Vec<ImageCandidate>) -> Vec<String> {
+    let mut best_by_id: HashMap<String, ImageCandidate> = HashMap::new();
+    for candidate in candidates {
+        best_by_id
+            .entry(candidate.image_id.clone())
+            .and_modify(|existing| {
+                let first_seen = existing.first_seen.min(candidate.first_seen);
+                if candidate.variant_rank < existing.variant_rank {
+                    *existing = candidate.clone();
+                }
+                existing.first_seen = first_seen;
+            })
+            .or_insert(candidate);
+    }
+
+    let mut selected: Vec<ImageCandidate> = best_by_id.into_values().collect();
+    selected.sort_by(|a, b| {
+        a.first_seen
+            .cmp(&b.first_seen)
+            .then_with(|| a.variant_rank.cmp(&b.variant_rank))
+            .then_with(|| a.image_id.cmp(&b.image_id))
+    });
+    selected
+        .into_iter()
+        .map(|candidate| candidate.url)
+        .collect()
+}
+
+fn image_variant_rank(variant: &str) -> Option<usize> {
+    match variant {
+        "y" => Some(0),
+        "l" => Some(1),
+        "g" => Some(2),
+        "r" => Some(3),
+        "s" => Some(4),
+        _ => None,
+    }
+}
+
+fn product_code_path_key(product_code: &str) -> String {
+    product_code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn split_srcset(srcset: &str) -> Vec<String> {
+    srcset
+        .split(',')
+        .filter_map(|part| part.split_whitespace().next())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn normalize_image_url(raw: &str) -> Option<String> {
+    if raw.starts_with("data:") || raw.trim().is_empty() {
+        return None;
+    }
+    normalize_url(raw, "https://www.iherb.com")
+}
+
+fn normalize_url(raw: &str, base_url: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        Some(raw.to_string())
+    } else if raw.starts_with("//") {
+        Some(format!("https:{}", raw))
+    } else if raw.starts_with('/') {
+        Some(format!("{}{}", base_url.trim_end_matches('/'), raw))
+    } else {
+        None
+    }
+}
+
+fn extract_section_text(doc: &Html, selectors: &str) -> Option<String> {
+    for sel_str in selectors.split(',') {
+        let Ok(sel) = Selector::parse(sel_str.trim()) else {
+            continue;
+        };
+        if let Some(element) = doc.select(&sel).next() {
+            let text = element_text_by_paragraph(&element);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn element_text_by_paragraph(element: &scraper::ElementRef) -> String {
+    let p_sel = match Selector::parse("p, li") {
+        Ok(sel) => sel,
+        Err(_) => return normalize_text(&element.text().collect::<Vec<_>>().join(" ")),
+    };
+    let parts: Vec<String> = element
+        .select(&p_sel)
+        .map(|el| normalize_text(&el.text().collect::<Vec<_>>().join(" ")))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        normalize_text(&element.text().collect::<Vec<_>>().join(" "))
+    } else {
+        parts.join("\n\n")
+    }
+}
+
+fn normalize_text(text: &str) -> String {
+    text.replace('\u{a0}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
 }
 
 fn extract_rating_from_stars(doc: &Html) -> Option<f64> {
@@ -856,4 +1257,81 @@ fn parse_width_percent(style: &str) -> Option<f64> {
             }
         })
         .next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        let path = format!("{}/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
+        std::fs::read_to_string(path).expect("fixture should load")
+    }
+
+    #[test]
+    fn parses_single_nutrient_other_ingredients_as_section_text() {
+        let html = fixture(
+            "iherb-product-59561-california-gold-nutrition-gold-c-powder-usp-grade-vitamin-c-1-000-mg-8-81-oz-250-g.html",
+        );
+        let product = parse_from_html(&html, "59561", "https://www.iherb.com", "USD")
+            .expect("product fixture should parse");
+
+        assert_eq!(product.product_code.as_deref(), Some("CGN-00935"));
+        assert!(product
+            .image_url
+            .as_deref()
+            .is_some_and(|url| url.contains("/images/cgn/cgn00935/y/197.jpg")));
+        assert!(product
+            .image_urls
+            .iter()
+            .all(|url| !url.contains("/images/static/") && !url.contains("/images/cms/")));
+
+        let breadcrumb = product
+            .category_breadcrumb
+            .as_ref()
+            .expect("breadcrumb should parse");
+        assert_eq!(breadcrumb.first().map(String::as_str), Some("Supplements"));
+        assert!(!breadcrumb.iter().any(|crumb| crumb == "Categories"));
+        let certs = product
+            .key_info
+            .as_ref()
+            .map(|info| info.certifications_and_diet.as_slice())
+            .unwrap_or(&[]);
+        assert!(certs.contains(&"Gluten-free".to_string()));
+        assert!(certs.contains(&"Soy-free".to_string()));
+
+        let other = product.ingredients.expect("other ingredients should parse");
+        assert!(other.contains("Main Ingredients"));
+        assert!(other.contains("Vitamin C (as Ascorbic Acid)"));
+        assert!(other.contains("Other Ingredients"));
+        assert!(other.contains("None"));
+
+        let facts = product
+            .supplement_facts
+            .expect("supplement facts should parse");
+        assert_eq!(facts.serving_size.as_deref(), Some("1 Scoop (1 g)"));
+        assert_eq!(facts.servings_per_container.as_deref(), Some("250"));
+        assert_eq!(facts.nutrients.len(), 1);
+    }
+
+    #[test]
+    fn preserves_complex_supplement_other_ingredients_notes() {
+        let html = fixture(
+            "iherb-product-104996-california-gold-nutrition-multivitamin-and-mineral-with-methyl-b12-vitamin-c-l-methylfolate-and-quercetin-two-a-day-60-veggie-capsules.htm",
+        );
+        let product = parse_from_html(&html, "104996", "https://www.iherb.com", "USD")
+            .expect("multivitamin fixture should parse");
+
+        let other = product.ingredients.expect("other ingredients should parse");
+        assert!(other.contains("Main Ingredients"));
+        assert!(other.contains("Vitamin A"));
+        assert!(other.contains("Other Ingredients"));
+        assert!(other.contains("Modified Cellulose"));
+        assert!(other.contains("Formulated with Magnafolate"));
+
+        let facts = product
+            .supplement_facts
+            .expect("supplement facts should parse");
+        assert!(facts.nutrients.len() > 25);
+    }
 }

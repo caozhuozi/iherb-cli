@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub delay_ms: u64,
     pub debug: bool,
     pub browser_path: Option<PathBuf>,
+    pub profile_dir: Option<PathBuf>,
+    pub timing: bool,
     pub cache_dir: PathBuf,
     pub data_dir: PathBuf,
 }
@@ -35,6 +37,8 @@ impl AppConfig {
         no_cache: bool,
         delay: Option<u64>,
         debug: bool,
+        profile_dir: Option<PathBuf>,
+        timing: bool,
     ) -> Result<Self, IherbError> {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -78,6 +82,8 @@ impl AppConfig {
             delay_ms,
             debug,
             browser_path,
+            profile_dir,
+            timing,
             cache_dir,
             data_dir,
         })
@@ -85,14 +91,10 @@ impl AppConfig {
 
     pub fn validate_country(country: &str) -> Result<(), IherbError> {
         const KNOWN_COUNTRIES: &[&str] = &[
-            "us", "ca", "au", "nz", "sg", "hk", "tw", "kr", "jp",
-            "sa", "ae", "kw", "il",
-            "de", "fr", "es", "it", "nl", "be", "at", "ch",
-            "se", "no", "dk", "fi", "pl", "cz", "ie", "pt", "gr",
-            "ru", "tr", "in", "th", "my", "ph", "id", "vn",
-            "br", "mx", "cl", "co", "ar",
-            "za", "eg", "ng", "ke",
-            "cn",
+            "us", "ca", "au", "nz", "sg", "hk", "tw", "kr", "jp", "sa", "ae", "kw", "il", "de",
+            "fr", "es", "it", "nl", "be", "at", "ch", "se", "no", "dk", "fi", "pl", "cz", "ie",
+            "pt", "gr", "ru", "tr", "in", "th", "my", "ph", "id", "vn", "br", "mx", "cl", "co",
+            "ar", "za", "eg", "ng", "ke", "cn",
         ];
         if !KNOWN_COUNTRIES.contains(&country) {
             return Err(IherbError::Navigation(format!(

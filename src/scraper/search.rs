@@ -174,9 +174,17 @@ fn parse_product_summary_json(item: &serde_json::Value, base_url: &str) -> Optio
         })
         .unwrap_or_else(|| format!("{}/pr/p/{}", base_url, product_id));
 
+    let product_code = item
+        .get("partNumber")
+        .or_else(|| item.get("productCode"))
+        .or_else(|| item.get("sku"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     Some(ProductSummary {
         name,
         brand,
+        product_code,
         price,
         original_price,
         currency,
@@ -207,9 +215,9 @@ pub fn parse_search_from_html(
         let cards: Vec<_> = doc.select(&card_sel).collect();
         tracing::debug!("Found {} product-cell-container cards", cards.len());
         products.extend(
-            cards
-                .iter()
-                .filter_map(|card| parse_product_card(card, &link_sel, &detected_currency, base_url)),
+            cards.iter().filter_map(|card| {
+                parse_product_card(card, &link_sel, &detected_currency, base_url)
+            }),
         );
     }
 
@@ -260,6 +268,11 @@ fn parse_product_card(
         .unwrap_or("")
         .to_string();
 
+    let product_code = link_attrs
+        .and_then(|a| a.attr("data-part-number"))
+        .map(|s| s.to_string())
+        .or_else(|| extract_card_attr(card_el, "[itemprop='sku']", "content"));
+
     let price = extract_card_attr(card_el, "meta[itemprop='price']", "content")
         .and_then(|s| parse_price_str(&s))
         .or_else(|| {
@@ -275,8 +288,8 @@ fn parse_product_card(
 
     let rating = extract_card_rating(card_el);
 
-    let review_count = extract_element_text(card_el, "a.rating-count span")
-        .and_then(|s| parse_review_count(&s));
+    let review_count =
+        extract_element_text(card_el, "a.rating-count span").and_then(|s| parse_review_count(&s));
 
     let in_stock = extract_card_stock_status(card_el, link_attrs);
 
@@ -294,6 +307,7 @@ fn parse_product_card(
     Some(ProductSummary {
         name,
         brand,
+        product_code,
         price,
         original_price,
         currency: currency.to_string(),
@@ -392,3 +406,32 @@ fn extract_total_results(doc: &Html) -> Option<u32> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_search_discovery_fields_from_fixture() {
+        let path = format!(
+            "{}/fixtures/iherb-search-vitamin_c.html",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let html = std::fs::read_to_string(path).expect("fixture should load");
+        let result = parse_search_from_html(&html, "vitamin c", "https://www.iherb.com", "USD")
+            .expect("search fixture should parse");
+
+        assert!(result.total_results.is_some_and(|total| total > 0));
+        assert!(!result.products.is_empty());
+
+        let powder = result
+            .products
+            .iter()
+            .find(|product| product.product_id == "59561")
+            .expect("fixture should include product 59561");
+        assert_eq!(powder.product_code.as_deref(), Some("CGN-00935"));
+        assert_eq!(
+            powder.product_url,
+            "https://www.iherb.com/pr/california-gold-nutrition-gold-c-powder-usp-grade-vitamin-c-1-000-mg-8-81-oz-250-g/59561"
+        );
+    }
+}
